@@ -5,6 +5,16 @@
 //! fails as unconfigured. KiCad's own default is predictable —
 //! `<temp dir>/kicad/api.sock` — so look there before giving up.
 //!
+//! That default is not the whole story, because KiCad binds one socket per
+//! *frame* rather than one per process. The project manager owns `api.sock`
+//! and answers document queries with `AS_UNHANDLED` — it holds no document to
+//! answer about — while a standalone editor registers its own
+//! `api-<pid>.sock` beside it. Both are offered here, live frames first:
+//! adopting the manager's socket while an editor is open spends every
+//! document command on an endpoint that was never going to answer one, and
+//! the file-editing fallback that follows looks like a bug in this crate
+//! rather than the wrong address.
+//!
 //! Looking is all this module does, and it never opens a connection: what
 //! sits at that path is KiCad's NNG endpoint, and dialling it outside the NNG
 //! protocol is what wedged the editor in #498. Whether the endpoint answers is
@@ -23,19 +33,167 @@ pub fn candidate_socket_paths() -> Vec<PathBuf> {
 }
 
 fn candidates_in(temp_dir: &Path) -> Vec<PathBuf> {
-    let mut candidates = vec![temp_dir.join("kicad").join("api.sock")];
+    candidates_listed_by(temp_dir, frame_sockets_in)
+}
+
+/// [`candidates_in`] with per-frame discovery supplied, so a test can prove the
+/// ordering without a running KiCad to register a frame socket.
+fn candidates_listed_by(
+    temp_dir: &Path,
+    frame_sockets: impl Fn(&Path) -> Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut directories = vec![temp_dir.join("kicad")];
     // macOS resolves the temp dir under /var/folders/…, but KiCad has been
     // seen on /tmp there; try both rather than betting on one. Only there:
     // /tmp is shared and world-writable, and on Linux the temp dir already
     // *is* /tmp unless TMPDIR says otherwise, so the fallback would buy no
     // coverage while letting any local user pre-bind the path we adopt.
     if cfg!(target_os = "macos") {
-        let shared_tmp = PathBuf::from("/tmp/kicad/api.sock");
-        if !candidates.contains(&shared_tmp) {
-            candidates.push(shared_tmp);
+        let shared_tmp = PathBuf::from("/tmp/kicad");
+        if !directories.contains(&shared_tmp) {
+            directories.push(shared_tmp);
+        }
+    }
+
+    // Live per-frame sockets first. KiCad exposes one socket per *frame*, not
+    // one per process: the project manager owns `api.sock` and answers
+    // `GetOpenDocuments` with `AS_UNHANDLED` because it holds no document,
+    // while a standalone editor registers its own `api-<pid>.sock`. Offering
+    // only the well-known path handed such a session an endpoint that cannot
+    // serve a single document command, and the file-editing fallback that
+    // followed read as a Konnect bug rather than as the wrong socket.
+    let mut candidates: Vec<PathBuf> = directories
+        .iter()
+        .flat_map(|directory| frame_sockets(directory.as_path()))
+        .collect();
+
+    // …then the well-known default. It is still the right answer when the
+    // frame is hosted by the manager's own process, and it stays a candidate
+    // even when stale, for the reasons [`detect_ipc_address`] documents.
+    for directory in &directories {
+        let default = directory.join("api.sock");
+        if !candidates.contains(&default) {
+            candidates.push(default);
         }
     }
     candidates
+}
+
+/// Live per-frame sockets in `kicad_dir`, best endpoint first.
+///
+/// KiCad names these after the frame's process — `api-<pid>.sock` — and never
+/// unlinks them, so this directory collects one corpse per editor that has ever
+/// run on a long-lived desktop. Here, unlike `api.sock`, the stale ones are
+/// dropped rather than offered: the pid in the name puts liveness one `/proc`
+/// read away, and a dead frame placed ahead of a live manager would be a
+/// regression rather than a new option. Nothing here connects to find out —
+/// that remains the bounded `Ping`'s job, for the reasons [`is_adoptable`]
+/// gives.
+#[cfg(unix)]
+fn frame_sockets_in(kicad_dir: &Path) -> Vec<PathBuf> {
+    frame_sockets_found_by(kicad_dir, frame_owner)
+}
+
+/// [`frame_sockets_in`] where the endpoint has no filesystem presence.
+///
+/// NNG maps `ipc://` to a named pipe on Windows, and KiCad's per-frame pipes
+/// cannot be enumerated the way [`is_adoptable`] looks one up by name, so
+/// Windows keeps the well-known default it already had.
+#[cfg(not(unix))]
+fn frame_sockets_in(_kicad_dir: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Which KiCad frame a socket belongs to, in the order this crate prefers them.
+///
+/// Every typed command this crate sends is a board command, so a `pcbnew` frame
+/// is the endpoint worth having. A schematic frame is ranked last rather than
+/// dropped: KiCad 10 answers `AS_UNHANDLED` on it for even `GetVersion`, but
+/// `schematic_commands.proto` is empty only on the 10.0 branch — master carries
+/// `GetSchematicHierarchy`, `GetSchematicNetlist` and `PlaceSymbolFromLibrary`
+/// — so that frame becomes worth dialling without a change here.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FrameRank {
+    Board,
+    Unidentified,
+    Schematic,
+}
+
+/// The live KiCad frame behind `pid`, or `None` when nothing there is one.
+///
+/// Liveness and identity are one question. A pid in a socket name is only as
+/// good as the process still being there, and pids are reused — so a name whose
+/// pid now belongs to something that is not a KiCad frame is treated as the
+/// stale socket it is, rather than as an endpoint to hand the board to.
+#[cfg(target_os = "linux")]
+fn frame_owner(pid: u32) -> Option<FrameRank> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    match comm.trim() {
+        "pcbnew" => Some(FrameRank::Board),
+        "eeschema" => Some(FrameRank::Schematic),
+        // The manager hosts editor frames inside its own process through
+        // KIFACE, so its pid is a frame's pid too — and which editor that is
+        // cannot be read off the process name.
+        "kicad" => Some(FrameRank::Unidentified),
+        _ => None,
+    }
+}
+
+/// [`frame_owner`] where `/proc` is not available.
+///
+/// macOS uses the same `api-<pid>.sock` naming and offers no process name to
+/// read, so liveness is asked of the kernel directly and the frame is left
+/// unidentified. Signal 0 runs the existence and permission checks without
+/// delivering anything.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn frame_owner(pid: u32) -> Option<FrameRank> {
+    // SAFETY: kill() with signal 0 delivers no signal and touches no memory.
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+    alive.then_some(FrameRank::Unidentified)
+}
+
+/// [`frame_sockets_in`] with owner resolution supplied, so a test can put a
+/// live frame of a chosen kind behind a socket name without starting KiCad.
+#[cfg(unix)]
+fn frame_sockets_found_by(
+    kicad_dir: &Path,
+    owner: impl Fn(u32) -> Option<FrameRank>,
+) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(kicad_dir) else {
+        return Vec::new();
+    };
+
+    let mut found: Vec<(FrameRank, std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let rank = owner(frame_pid(&path)?)?;
+            let registered = entry.metadata().and_then(|meta| meta.modified()).ok()?;
+            Some((rank, registered, path))
+        })
+        .collect();
+
+    // Newest first within a rank: with two frames of the same kind open, the
+    // one started most recently is the one the user most likely just opened
+    // the document in.
+    found.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
+    found.into_iter().map(|(_, _, path)| path).collect()
+}
+
+/// The pid KiCad named a per-frame socket after, or `None` for any other name.
+///
+/// `api.sock` deliberately does not match: it is the manager's, it is already
+/// handled as the well-known default, and it carries no pid to prove anything
+/// with.
+#[cfg(unix)]
+fn frame_pid(path: &Path) -> Option<u32> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("api-")?
+        .strip_suffix(".sock")?
+        .parse()
+        .ok()
 }
 
 /// The IPC address to use when `KICAD_API_SOCKET` is unset, or `None` when
@@ -479,6 +637,124 @@ mod tests {
         assert_eq!(
             format_address(Path::new("/tmp/kicad/api.sock")),
             "ipc:///tmp/kicad/api.sock"
+        );
+    }
+
+    /// Per-frame sockets come first. The manager's `api.sock` cannot serve a
+    /// single document command — it answers `GetOpenDocuments` with
+    /// `AS_UNHANDLED` — which is the whole reason discovery looks wider.
+    #[test]
+    fn a_live_frame_is_offered_before_the_manager_socket() {
+        let frame = PathBuf::from("/somewhere/tmp/kicad/api-4321.sock");
+        let candidates = candidates_listed_by(Path::new("/somewhere/tmp"), |directory| {
+            if directory == Path::new("/somewhere/tmp/kicad") {
+                vec![frame.clone()]
+            } else {
+                Vec::new()
+            }
+        });
+
+        assert_eq!(candidates[0], frame);
+        assert_eq!(
+            candidates[1],
+            PathBuf::from("/somewhere/tmp/kicad/api.sock"),
+            "the well-known default stays, for the manager-hosted frame case"
+        );
+    }
+
+    /// With no live frame, discovery behaves exactly as it did before.
+    #[test]
+    fn the_manager_socket_is_the_fallback_when_no_frame_is_live() {
+        let candidates = candidates_listed_by(Path::new("/somewhere/tmp"), |_| Vec::new());
+        assert_eq!(
+            candidates[0],
+            PathBuf::from("/somewhere/tmp/kicad/api.sock")
+        );
+    }
+
+    /// A socket whose process is gone is a corpse, not an endpoint. These
+    /// fixtures are plain files: socket-ness is [`is_adoptable`]'s question,
+    /// and asking it here would only duplicate the gate.
+    #[test]
+    #[cfg(unix)]
+    fn a_frame_socket_whose_process_is_gone_is_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("api-4294967295.sock"), b"").unwrap();
+
+        assert!(
+            frame_sockets_in(dir.path()).is_empty(),
+            "a pid that owns nothing cannot be a frame"
+        );
+    }
+
+    /// Pids are reused, so being alive is not enough — it has to be a frame.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_frame_socket_whose_pid_is_not_a_kicad_frame_is_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        // This process is certainly alive and certainly not a KiCad editor.
+        let squatter = format!("api-{}.sock", std::process::id());
+        std::fs::write(dir.path().join(squatter), b"").unwrap();
+
+        assert!(frame_sockets_in(dir.path()).is_empty());
+    }
+
+    /// Board frames first: every typed command this crate sends is a board
+    /// command, and KiCad 10's schematic frame answers `AS_UNHANDLED` on all
+    /// of them.
+    #[test]
+    #[cfg(unix)]
+    fn board_frames_outrank_schematic_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("api-11.sock"), b"").unwrap();
+        std::fs::write(dir.path().join("api-22.sock"), b"").unwrap();
+
+        let found = frame_sockets_found_by(dir.path(), |pid| match pid {
+            11 => Some(FrameRank::Schematic),
+            22 => Some(FrameRank::Board),
+            _ => None,
+        });
+
+        assert_eq!(
+            found,
+            vec![
+                dir.path().join("api-22.sock"),
+                dir.path().join("api-11.sock")
+            ]
+        );
+    }
+
+    /// Two frames of the same kind: the one registered most recently wins.
+    #[test]
+    #[cfg(unix)]
+    fn the_newest_frame_of_a_kind_is_offered_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("api-11.sock");
+        let newer = dir.path().join("api-22.sock");
+        for (path, seconds) in [(&older, 1_000), (&newer, 2_000)] {
+            let handle = std::fs::File::create(path).unwrap();
+            handle
+                .set_modified(
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                )
+                .unwrap();
+        }
+
+        let found = frame_sockets_found_by(dir.path(), |_| Some(FrameRank::Board));
+
+        assert_eq!(found, vec![newer, older]);
+    }
+
+    /// The manager's socket carries no pid and must not be ranked as a frame.
+    #[test]
+    #[cfg(unix)]
+    fn the_manager_socket_is_not_mistaken_for_a_frame() {
+        assert_eq!(frame_pid(Path::new("/tmp/kicad/api.sock")), None);
+        assert_eq!(frame_pid(Path::new("/tmp/kicad/api-.sock")), None);
+        assert_eq!(frame_pid(Path::new("/tmp/kicad/api-notapid.sock")), None);
+        assert_eq!(
+            frame_pid(Path::new("/tmp/kicad/api-2417522.sock")),
+            Some(2_417_522)
         );
     }
 }
