@@ -1783,10 +1783,42 @@ impl KiCadIpcClient {
             }
         };
 
-        let documents = documents
+        let documents = match documents
             .into_iter()
             .map(|document| editor_document_from_specifier(editor, document))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(documents) => documents,
+            Err(error) => {
+                // KiCad 10 answers `GetOpenDocuments` for an open schematic
+                // frame but leaves the sheet path empty — on the 10.0 branch
+                // there are no schematic commands for it to identify a
+                // document to, so an unidentifiable schematic document is the
+                // normal case rather than a fault. One editor that cannot name
+                // its documents is not evidence about the other, and failing
+                // the whole observation here made a live, perfectly
+                // identifiable board unreachable whenever a schematic frame
+                // happened to be open beside it. Report it the way an
+                // unsupported endpoint is reported and leave the sibling
+                // editor's answer standing.
+                if let Some(document_error) = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<IpcDocumentObservationError>())
+                {
+                    return Ok(IpcEditorObservation {
+                        editor,
+                        addressable: false,
+                        documents: Vec::new(),
+                        capabilities: editor_capabilities(editor, version, false),
+                        unavailable_reason: Some(format!(
+                            "KiCad reported an open document this editor cannot identify: {}",
+                            document_error.reason
+                        )),
+                    });
+                }
+                return Err(error);
+            }
+        };
         Ok(IpcEditorObservation {
             editor,
             addressable: true,
